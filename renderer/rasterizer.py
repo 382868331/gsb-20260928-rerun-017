@@ -127,48 +127,88 @@ def _edge(a: Tuple[float, float], b: Tuple[float, float], p: Tuple[float, float]
 
 Fragment = Tuple[int, int, float, float, Tuple[float, float], Tuple[float, float, float]]
 
+# Sub-pixel grid used for edge functions. Projected vertex coordinates are
+# snapped to this fixed-point grid so a shared edge has bit-identical
+# endpoints in every triangle that uses it; an exact integer fill rule can
+# then hand a boundary pixel to exactly one owner instead of relying on an
+# epsilon that floating-point edge values can overshoot on large triangles.
+SUBPIXEL_BITS = 8
+SUBPIXEL_SCALE = 1 << SUBPIXEL_BITS
+
 
 def _collect_fragments(
     projected: Sequence[ProjectedVertex],
     width: int,
     height: int,
 ) -> List[Fragment]:
-    points = [(vertex[0], vertex[1]) for vertex in projected]
-    area = _edge(points[0], points[1], points[2])
-    if abs(area) < 1e-10:
+    points = [
+        (
+            int(round(vertex[0] * SUBPIXEL_SCALE)),
+            int(round(vertex[1] * SUBPIXEL_SCALE)),
+        )
+        for vertex in projected
+    ]
+    area_float = _edge(
+        (projected[0][0], projected[0][1]),
+        (projected[1][0], projected[1][1]),
+        (projected[2][0], projected[2][1]),
+    )
+    if abs(area_float) < 1e-12:
         return []
-    orientation = 1.0 if area > 0.0 else -1.0
-    # A shared edge belongs to the triangle for which it is a top/left edge,
-    # so neighbouring triangulations never double-blend or leave a gap.
-    biases = []
+    area012 = (
+        (points[2][0] - points[0][0]) * (points[1][1] - points[0][1])
+        - (points[2][1] - points[0][1]) * (points[1][0] - points[0][0])
+    )
+    if area012 == 0:
+        return []
+    orientation = 1 if area012 > 0 else -1
+    # Exact top/left fill convention: a boundary sample is owned by the
+    # triangle for which the shared edge is a top or left edge. Two adjacent
+    # triangles traverse a shared edge in opposite directions, so the sample
+    # is covered exactly once regardless of triangulation or submit order.
+    top_left = []
     for i in range(3):
         j = (i + 1) % 3
         edge_y = points[j][1] - points[i][1]
         edge_x = points[j][0] - points[i][0]
         if orientation > 0.0:
-            top_left = edge_y < 0.0 or (edge_y == 0.0 and edge_x > 0.0)
+            is_top_left = edge_y < 0 or (edge_y == 0 and edge_x > 0)
         else:
-            top_left = edge_y > 0.0 or (edge_y == 0.0 and edge_x < 0.0)
-        biases.append(0.0 if top_left else -1e-9)
+            is_top_left = edge_y > 0 or (edge_y == 0 and edge_x < 0)
+        top_left.append(is_top_left)
 
-    min_x = max(0, int(math.floor(min(point[0] for point in points) - 0.5)))
-    max_x = min(width - 1, int(math.ceil(max(point[0] for point in points) - 0.5)))
-    min_y = max(0, int(math.floor(min(point[1] for point in points) - 0.5)))
-    max_y = min(height - 1, int(math.ceil(max(point[1] for point in points) - 0.5)))
+    min_x = max(0, (min(point[0] for point in points) - SUBPIXEL_SCALE // 2) // SUBPIXEL_SCALE)
+    max_x = min(
+        width - 1,
+        (max(point[0] for point in points) - SUBPIXEL_SCALE // 2) // SUBPIXEL_SCALE + 1,
+    )
+    min_y = max(0, (min(point[1] for point in points) - SUBPIXEL_SCALE // 2) // SUBPIXEL_SCALE)
+    max_y = min(
+        height - 1,
+        (max(point[1] for point in points) - SUBPIXEL_SCALE // 2) // SUBPIXEL_SCALE + 1,
+    )
 
     edges = (
-        (points[1], points[2], biases[0]),
-        (points[2], points[0], biases[1]),
-        (points[0], points[1], biases[2]),
+        (points[1], points[2], 0),
+        (points[2], points[0], 1),
+        (points[0], points[1], 2),
     )
     fragments: List[Fragment] = []
     for y in range(min_y, max_y + 1):
         for x in range(min_x, max_x + 1):
-            sample = (x + 0.5, y + 0.5)
-            weights = [_edge(a, b, sample) * orientation + bias for a, b, bias in edges]
-            if any(weight < 0.0 for weight in weights):
+            sample = (x * SUBPIXEL_SCALE + SUBPIXEL_SCALE // 2, y * SUBPIXEL_SCALE + SUBPIXEL_SCALE // 2)
+            weights = []
+            for edge_index, (a, b, _) in enumerate(edges):
+                cross = (
+                    (sample[0] - a[0]) * (b[1] - a[1])
+                    - (sample[1] - a[1]) * (b[0] - a[0])
+                ) * orientation
+                if cross < 0 or (cross == 0 and not top_left[edge_index]):
+                    cross = -1
+                weights.append(cross)
+            if any(weight < 0 for weight in weights):
                 continue
-            denominator = area * orientation
+            denominator = float(area012 * orientation)
             b0 = weights[0] / denominator
             b1 = weights[1] / denominator
             b2 = weights[2] / denominator

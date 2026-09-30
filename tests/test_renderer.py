@@ -7,6 +7,10 @@ from pathlib import Path
 from renderer import Camera, Mesh, RenderOptions, Scene, Triangle, render
 from renderer.rasterizer import clip_triangle
 from scenes.texture_scene import (
+    SEAM_BLENDED,
+    SEAM_BACKDROP,
+    transparent_layers_scene,
+    transparent_seam_scene,
     near_textured_scene,
     transparent_overlap_scene,
     triangulation_scene,
@@ -130,6 +134,123 @@ class RendererTests(unittest.TestCase):
                 scene.save(path)
                 after = render(Scene.load(path), options).pixels
             self.assertEqual(before, after)
+
+    def test_transparent_shared_edge_is_covered_exactly_once(self):
+        # The translucent plane over a flat backdrop has exactly two legal
+        # colours: backdrop (uncovered) and one source-over blend. A darker
+        # third colour means the seam was blended twice; a backdrop pixel
+        # inside the surface means a gap.
+        options = RenderOptions(96, 72, "front")
+        image = render(transparent_seam_scene("a"), options)
+        legal = {SEAM_BACKDROP, SEAM_BLENDED}
+        illegal = [pixel for pixel in image.pixels if pixel not in legal]
+        self.assertEqual(illegal, [])
+        self.assertIn(SEAM_BLENDED, image.pixels)
+
+    def test_transparent_seam_is_independent_of_triangulation_and_order(self):
+        options = RenderOptions(96, 72, "front")
+        variants = [
+            transparent_seam_scene("a"),
+            transparent_seam_scene("b"),
+            transparent_seam_scene("a", reverse=True),
+            transparent_seam_scene("b", reverse=True),
+        ]
+        images = [render(scene, options).pixels for scene in variants]
+        for pixels in images[1:]:
+            self.assertEqual(images[0], pixels)
+
+    def test_transparent_layers_are_independent_of_split_and_submit_order(self):
+        options = RenderOptions(104, 80, "front")
+        reference = render(transparent_layers_scene("a"), options).pixels
+        for scene in (
+            transparent_layers_scene("b"),
+            transparent_layers_scene("a", reverse_layers=True),
+            transparent_layers_scene("b", reverse_layers=True),
+        ):
+            self.assertEqual(reference, render(scene, options).pixels)
+
+    def test_transparent_layers_stay_consistent_when_camera_moves(self):
+        # Moving the camera changes the blend, but triangulation and submit
+        # order must still produce identical coverage and colour.
+        for camera_name in ("front", "moved"):
+            options = RenderOptions(104, 80, camera_name)
+            reference = render(transparent_layers_scene("a"), options).pixels
+            changed_split = render(transparent_layers_scene("b"), options).pixels
+            changed_order = render(transparent_layers_scene("a", reverse_layers=True), options).pixels
+            self.assertEqual(reference, changed_split)
+            self.assertEqual(reference, changed_order)
+
+    def test_transparent_clip_and_screen_edge_zoom_inspection(self):
+        # Local magnification of the strip where the translucent material
+        # crosses the near clip boundary and a screen edge. Upscaling each
+        # pixel keeps the values readable; both sides of the boundary are
+        # compared for the two triangulations, so a bright gap, a dark
+        # double-blend line, or a missing green channel would fail the exact
+        # pixel equality and legal-colour assertions.
+        from renderer.image import Image
+
+        size = 64
+        options = RenderOptions(size, size, "front")
+        rendered = {
+            (diagonal, camera_name): render(
+                transparent_seam_scene(diagonal), RenderOptions(size, size, camera_name)
+            )
+            for diagonal in ("a", "b")
+            for camera_name in ("front", "moved")
+        }
+        for image in rendered.values():
+            for pixel in image.pixels:
+                self.assertIn(pixel, (SEAM_BACKDROP, SEAM_BLENDED))
+
+        def magnify(image, x0, y0, w, h, scale=4):
+            zoom = Image(w * scale, h * scale, (0, 0, 0))
+            for row in range(h):
+                for col in range(w):
+                    colour = image.get_pixel(x0 + col, y0 + row)
+                    for dy in range(scale):
+                        for dx in range(scale):
+                            zoom.set_pixel(col * scale + dx, row * scale + dy, colour)
+            return zoom
+
+        inspection_regions = {
+            # Front camera: the near clip edge runs across this band, so the
+            # magnified strip shows covered and uncovered rows back to back.
+            "front": (20, 18, 24, 10),
+            # Moved camera: near boundary is slanted and the material also
+            # meets a screen edge, so individual rows show both sides of the
+            # boundary side by side.
+            "moved": (0, 36, 64, 12),
+        }
+        for camera_name, region in inspection_regions.items():
+            x0, y0, w, h = region
+            image_a = rendered[("a", camera_name)]
+            image_b = rendered[("b", camera_name)]
+            seen = set()
+            for y in range(y0, y0 + h):
+                for x in range(x0, x0 + w):
+                    seen.add(image_a.get_pixel(x, y))
+            self.assertEqual(seen, {SEAM_BACKDROP, SEAM_BLENDED})
+            self.assertEqual(magnify(image_a, *region).pixels, magnify(image_b, *region).pixels)
+        # Green is present in the single blend (60, 200, 120 over backdrop)
+        # and dominates red/blue there; the reported lost-green seam cannot
+        # reappear without an illegal third colour above.
+        self.assertGreater(SEAM_BLENDED[1], SEAM_BLENDED[0])
+
+    def test_transparent_seam_round_trip_through_json_at_both_cameras(self):
+        for camera_name in ("front", "moved"):
+            options = RenderOptions(87, 61, camera_name)
+            scenes = [
+                transparent_seam_scene("a"),
+                transparent_seam_scene("b", reverse=True),
+                transparent_layers_scene("b", reverse_layers=True),
+            ]
+            for scene in scenes:
+                before = render(scene, options).pixels
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "seam.json"
+                    scene.save(path)
+                    after = render(Scene.load(path), options).pixels
+                self.assertEqual(before, after)
 
 
 if __name__ == "__main__":

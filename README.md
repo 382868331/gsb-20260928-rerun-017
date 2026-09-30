@@ -29,7 +29,7 @@ The demo writes a reusable JSON scene plus `front` and `moved` camera images in 
 ## Textures and transparency
 
 - Each triangle optionally carries three UV pairs plus a named mesh texture; UVs and opacity are carried through all six clip planes as attribute / w and recovered with perspective-correct interpolation, so a surface looks identical under either diagonal triangulation and stays continuous where it crosses the near plane.
-- A top/left pixel-ownership rule assigns every shared edge to exactly one triangle, preventing seams and double alpha contribution.
+- Projected vertices are snapped to a sub-pixel fixed-point grid and an exact top/left pixel-ownership rule assigns every shared edge to exactly one triangle, so seams and double alpha contribution cannot reappear when the triangulation, submit order, camera, or clip position changes.
 - Opaque triangles are depth-tested first. Translucent fragments (per-triangle `opacity` in `[0, 1]`) are then composited back-to-front with straight source-over alpha blending; each fragment is hidden behind nearer opaque geometry.
 - Supported scope is single-pass alpha compositing with per-fragment depth sorting (intersecting layers are therefore ordered correctly at each pixel). Whole-surface order-independent transparency, transmission/refraction, and texture alpha cutouts are not implemented.
 - Textures are embedded procedurally generated pixel data in the versioned scene JSON; saving a scene and re-rendering it is bit-for-bit reproducible.

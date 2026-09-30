@@ -95,3 +95,97 @@ def transparent_overlap_scene() -> Scene:
         _cameras(),
         background=(12, 14, 20),
     )
+
+
+# Flat colours make a single source-over blend analytically exact: any pixel
+# covered twice along a shared edge produces a visibly different third colour,
+# while a gap exposes the backdrop, so seams cannot hide in the imagery.
+SEAM_BACKDROP = (10, 20, 30)
+SEAM_SURFACE = (60, 200, 120)
+SEAM_OPACITY = 0.5
+SEAM_BLENDED = tuple(
+    int(round(back * (1.0 - SEAM_OPACITY) + surface * SEAM_OPACITY))
+    for back, surface in zip(SEAM_BACKDROP, SEAM_SURFACE)
+)
+
+# A tilted plane that crosses the near plane and every screen edge depending
+# on the camera. The two far corners sit at different depths so the internal
+# diagonal is slanted in screen space instead of axis aligned.
+SEAM_CORNERS = [
+    (-3.0, -0.12, 0.28),
+    (3.2, -0.05, 0.34),
+    (3.4, 1.9, 3.0),
+    (-3.2, 1.7, 2.8),
+]
+
+
+def transparent_seam_scene(diagonal: str = "a", reverse: bool = False) -> Scene:
+    """One translucent plane over a full-frame flat opaque backdrop.
+
+    `diagonal` selects the triangulation of the shared internal edge and
+    `reverse` submits the triangles in the opposite order; the rendered
+    coverage and colour must be identical in every case.
+    """
+    backdrop = Mesh.quad(
+        "seam-backdrop",
+        [(-8.0, -8.0, 4.0), (8.0, -8.0, 4.0), (8.0, 8.0, 4.0), (-8.0, 8.0, 4.0)],
+        SEAM_BACKDROP,
+    )
+    if diagonal == "a":
+        triangles = [
+            Triangle((0, 1, 2), SEAM_SURFACE, opacity=SEAM_OPACITY),
+            Triangle((0, 2, 3), SEAM_SURFACE, opacity=SEAM_OPACITY),
+        ]
+    else:
+        triangles = [
+            Triangle((0, 3, 2), SEAM_SURFACE, opacity=SEAM_OPACITY),
+            Triangle((0, 2, 1), SEAM_SURFACE, opacity=SEAM_OPACITY),
+        ]
+    if reverse:
+        triangles = list(reversed(triangles))
+    surface = Mesh("seam-surface", list(SEAM_CORNERS), triangles)
+    return Scene(f"transparent-seam-{diagonal}", [backdrop, surface], _cameras(), background=(0, 0, 0))
+
+
+def transparent_layers_scene(diagonal: str = "a", reverse_layers: bool = False) -> Scene:
+    """Two stacked translucent planes (one always nearer) over a backdrop.
+
+    Both planes share their own four vertices between their triangles and
+    spill past the screen edges. Layer order is reversed by flag; fragment
+    depth sorting must make the result independent of submission order.
+    """
+    backdrop = Mesh.quad(
+        "layers-backdrop",
+        [(-8.0, -8.0, 4.5), (8.0, -8.0, 4.5), (8.0, 8.0, 4.5), (-8.0, 8.0, 4.5)],
+        (24, 24, 40),
+    )
+
+    def plane(name: str, corners, color, opacity: float) -> Mesh:
+        if diagonal == "a":
+            triangles = [
+                Triangle((0, 1, 2), color, opacity=opacity),
+                Triangle((0, 2, 3), color, opacity=opacity),
+            ]
+        else:
+            triangles = [
+                Triangle((0, 3, 2), color, opacity=opacity),
+                Triangle((0, 2, 1), color, opacity=opacity),
+            ]
+        return Mesh(name, list(corners), triangles)
+
+    far_layer = plane(
+        "layers-far",
+        [(-2.6, -1.7, 3.0), (2.4, -1.5, 2.7), (2.6, 1.6, 3.1), (-2.4, 1.8, 3.3)],
+        (220, 70, 70),
+        0.45,
+    )
+    near_layer = plane(
+        "layers-near",
+        [(-2.2, -1.8, 1.9), (2.8, -1.6, 1.7), (2.9, 1.9, 2.0), (-2.3, 1.7, 2.1)],
+        (70, 200, 120),
+        0.4,
+    )
+    layers = [backdrop, far_layer, near_layer]
+    if reverse_layers:
+        layers = [backdrop, near_layer, far_layer]
+    return Scene(f"transparent-layers-{diagonal}", layers, _cameras(), background=(0, 0, 0))
