@@ -6,6 +6,11 @@ from pathlib import Path
 
 from renderer import Camera, Mesh, RenderOptions, Scene, Triangle, render
 from renderer.rasterizer import clip_triangle
+from scenes.texture_scene import (
+    near_textured_scene,
+    transparent_overlap_scene,
+    triangulation_scene,
+)
 
 
 class RendererTests(unittest.TestCase):
@@ -88,6 +93,43 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(before, after)
         moved = render(scene, RenderOptions(57, 43, "moved")).pixels
         self.assertNotEqual(before, moved)
+
+    def test_textured_surface_is_independent_of_diagonal_split(self):
+        options = RenderOptions(96, 72, "front")
+        image_a = render(triangulation_scene("a"), options)
+        image_b = render(triangulation_scene("b"), options)
+        differing = sum(1 for a, b in zip(image_a.pixels, image_b.pixels) if a != b)
+        self.assertLess(differing / len(image_a.pixels), 0.002)
+        # The checker texture actually reaches the image rather than flat color.
+        self.assertGreaterEqual(len(set(image_a.pixels)), 4)
+
+    def test_texture_coordinates_survive_near_plane_clipping(self):
+        image = render(near_textured_scene(), RenderOptions(96, 72, "front"))
+        colors = set(image.pixels)
+        self.assertIn((70, 130, 220), colors)
+        self.assertIn((230, 220, 120), colors)
+        self.assertIn((200, 80, 80), colors)
+
+    def test_transparency_blends_back_to_front(self):
+        options = RenderOptions(64, 48, "front")
+        image = render(transparent_overlap_scene(), options)
+        center = image.get_pixel(32, 24)
+        for channel in center:
+            self.assertNotIn(channel, (0, 255))
+        # Alpha order changes when the camera moves.
+        moved = render(transparent_overlap_scene(), RenderOptions(64, 48, "moved"))
+        self.assertNotEqual(image.pixels, moved.pixels)
+
+    def test_textured_transparent_scene_round_trip_through_json(self):
+        scenes = [triangulation_scene("a"), near_textured_scene(), transparent_overlap_scene()]
+        options = RenderOptions(73, 57, "front")
+        for scene in scenes:
+            before = render(scene, options).pixels
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "scene.json"
+                scene.save(path)
+                after = render(Scene.load(path), options).pixels
+            self.assertEqual(before, after)
 
 
 if __name__ == "__main__":
