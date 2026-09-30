@@ -131,6 +131,96 @@ class RendererTests(unittest.TestCase):
                 after = render(Scene.load(path), options).pixels
             self.assertEqual(before, after)
 
+    def _green_surface_variants(self):
+        corners = [
+            (-1.4, -1.1, 0.3),
+            (1.9, -1.1, 2.8),
+            (1.1, 1.2, 2.1),
+            (-1.9, 1.2, 1.1),
+        ]
+        green = (0, 210, 0)
+        opacity = 0.5
+        variants = {
+            "diagonal_a": [Mesh(
+                "surface", corners,
+                [Triangle((0, 1, 2), green, opacity=opacity),
+                 Triangle((0, 2, 3), green, opacity=opacity)])],
+            "diagonal_b": [Mesh(
+                "surface", corners,
+                [Triangle((0, 3, 2), green, opacity=opacity),
+                 Triangle((0, 2, 1), green, opacity=opacity)])],
+            "reordered": [Mesh(
+                "surface", corners,
+                [Triangle((0, 2, 3), green, opacity=opacity),
+                 Triangle((0, 1, 2), green, opacity=opacity)])],
+            # Shared-vertex split: same surface submitted as two meshes.
+            "split_meshes": [
+                Mesh("surface_a", corners, [Triangle((0, 1, 2), green, opacity=opacity)]),
+                Mesh("surface_b", corners, [Triangle((0, 2, 3), green, opacity=opacity)])],
+            "split_reversed": [
+                Mesh("surface_a", corners, [Triangle((2, 3, 0), green, opacity=opacity)]),
+                Mesh("surface_b", corners, [Triangle((2, 0, 1), green, opacity=opacity)])],
+        }
+        return corners, variants
+
+    def test_transparent_surface_is_independent_of_split_and_submission(self):
+        corners, variants = self._green_surface_variants()
+        cameras = [
+            Camera("front", near=1.5, far=20, fov_y_degrees=55),
+            Camera("moved", eye=(0.9, 0.25, -0.8), target=(0, 0, 1), near=0.5, far=20),
+        ]
+        for camera in cameras:
+            for width, height in ((160, 120), (97, 73)):
+                options = RenderOptions(width, height, camera.name)
+                images = {
+                    name: render(Scene("seam", meshes, [camera], background=(255, 255, 255)), options).pixels
+                    for name, meshes in variants.items()
+                }
+                reference = images["diagonal_a"]
+                for name, pixels in images.items():
+                    self.assertEqual(
+                        reference, pixels,
+                        msg=f"transparent seam differs for {name} with camera {camera.name}",
+                    )
+
+    def test_clip_boundary_has_no_gap_or_double_blend(self):
+        # The near-plane cut runs diagonally across the surface; pixels just
+        # on either side of the boundary must carry the same single
+        # source-over contribution (green present exactly once).
+        corners, variants = self._green_surface_variants()
+        camera = Camera("front", near=1.5, far=20, fov_y_degrees=55)
+        options = RenderOptions(320, 240, "front")
+        scene = Scene("seam", variants["split_meshes"], [camera], background=(0, 0, 0))
+        image = render(scene, options)
+        covered = [p for p in image.pixels if p != (0, 0, 0)]
+        self.assertTrue(covered)
+        green_values = {pixel[1] for pixel in covered}
+        # A single source-over blend of (0,210) at 0.5 over black is 105.
+        # A missed seam stays 0 (green lost); a double blend becomes 157.
+        self.assertTrue(green_values)
+        self.assertTrue(all(value == 105 for value in green_values), green_values)
+
+    def test_multi_layer_transparent_split_round_trip(self):
+        corners, variants = self._green_surface_variants()
+        red_corners = [(-2.8, -2.2, 1.4), (3.1, -2.2, 2.6), (3.1, 2.4, 2.6), (-2.8, 2.4, 1.4)]
+        red = [
+            Mesh("red_a", red_corners, [Triangle((0, 1, 2), (220, 40, 40), opacity=0.4)]),
+            Mesh("red_b", red_corners, [Triangle((0, 2, 3), (220, 40, 40), opacity=0.4)]),
+        ]
+        camera = Camera("front", near=1.5, far=20, fov_y_degrees=55)
+        options = RenderOptions(120, 90, "front")
+        for green_key in ("diagonal_a", "split_meshes", "split_reversed"):
+            scene = Scene("layers", variants[green_key] + red, [camera], background=(10, 10, 24))
+            before = render(scene, options).pixels
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "layers.json"
+                scene.save(path)
+                after = render(Scene.load(path), options).pixels
+            self.assertEqual(before, after, msg=f"round trip differs for {green_key}")
+        reference = render(Scene("layers", variants["diagonal_a"] + red, [camera], background=(10, 10, 24)), options).pixels
+        split = render(Scene("layers", variants["split_meshes"] + red, [camera], background=(10, 10, 24)), options).pixels
+        self.assertEqual(reference, split)
+
 
 if __name__ == "__main__":
     unittest.main()

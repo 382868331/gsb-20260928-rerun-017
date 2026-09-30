@@ -79,6 +79,26 @@ def _interpolate(a: ClipVertex, b: ClipVertex, t: float) -> ClipVertex:
     return result
 
 
+def _clip_intersection(
+    inside: ClipVertex,
+    outside: ClipVertex,
+    inside_distance: float,
+    outside_distance: float,
+) -> ClipVertex:
+    # Always interpolate from the inside endpoint toward the outside one.
+    # Two neighbouring triangles share an edge in opposite traversal
+    # directions; a direction-dependent formula would otherwise generate two
+    # slightly different vertices for the same geometric clip point and leave
+    # a gap or a double-blended seam.
+    t = inside_distance / (inside_distance - outside_distance)
+    vertex = _interpolate(inside, outside, t)
+    # A crossing can land on the near plane to floating-point precision, where
+    # 1/w is undefined. Such a point has zero screen area, so drop it.
+    if vertex[3] <= 0.0:
+        return []
+    return [vertex]
+
+
 def clip_triangle(vertices: Sequence[ClipVertex]) -> List[List[ClipVertex]]:
     active = [list(vertices)]
     for inside_distance in _CLIP_TESTS:
@@ -91,18 +111,34 @@ def clip_triangle(vertices: Sequence[ClipVertex]) -> List[List[ClipVertex]]:
                 current_distance = inside_distance(current)
                 if current_distance >= 0.0:
                     if previous_distance < 0.0:
-                        denominator = current_distance - previous_distance
-                        clipped.append(_interpolate(previous, current, -previous_distance / denominator))
+                        clipped.extend(_clip_intersection(current, previous, current_distance, previous_distance))
                     clipped.append(current)
                 elif previous_distance >= 0.0:
-                    denominator = current_distance - previous_distance
-                    clipped.append(_interpolate(previous, current, -previous_distance / denominator))
+                    clipped.extend(_clip_intersection(previous, current, previous_distance, current_distance))
                 previous = current
                 previous_distance = current_distance
             if len(clipped) >= 3:
                 next_polygons.append(clipped)
         active = next_polygons
-    return [[polygon[0], polygon[i], polygon[i + 1]] for polygon in active for i in range(1, len(polygon) - 1)]
+    fan_triangles: List[List[ClipVertex]] = []
+    for polygon in active:
+        # Canonicalize winding in clip-space xy (orientation is preserved by
+        # the perspective divide for w > 0), then fan from the vertex smallest
+        # in (y, x). Reversed or reordered copies of the same triangle then
+        # decompose a clipped polygon into the exact same fan pieces.
+        area2 = 0.0
+        for i, vertex in enumerate(polygon):
+            nxt = polygon[(i + 1) % len(polygon)]
+            area2 += vertex[0] * nxt[1] - nxt[0] * vertex[1]
+        if area2 < 0.0:
+            polygon = list(reversed(polygon))
+        pivot = min(range(len(polygon)), key=lambda i: (polygon[i][1], polygon[i][0]))
+        ordered_polygon = polygon[pivot:] + polygon[:pivot]
+        fan_triangles.extend(
+            [ordered_polygon[0], ordered_polygon[i], ordered_polygon[i + 1]]
+            for i in range(1, len(ordered_polygon) - 1)
+        )
+    return fan_triangles
 
 
 ProjectedVertex = Tuple[float, float, float, Tuple[float, float], float, Tuple[float, float, float]]
@@ -133,7 +169,14 @@ def _collect_fragments(
     width: int,
     height: int,
 ) -> List[Fragment]:
-    points = [(vertex[0], vertex[1]) for vertex in projected]
+    # Order corners by screen position before rasterizing. The same
+    # geometric triangle submitted reversed, rotated, or as part of a
+    # differently triangulated surface must then walk its edges and sum its
+    # perspective attributes in one canonical order, so seam pixels carry
+    # identical coverage and shading (including the green channel) rather
+    # than a last-binary-digit flicker.
+    ordered = sorted(projected, key=lambda vertex: (vertex[1], vertex[0], vertex[2]))
+    points = [(vertex[0], vertex[1]) for vertex in ordered]
     area = _edge(points[0], points[1], points[2])
     if abs(area) < 1e-10:
         return []
@@ -172,15 +215,15 @@ def _collect_fragments(
             b0 = weights[0] / denominator
             b1 = weights[1] / denominator
             b2 = weights[2] / denominator
-            inv_w = b0 * projected[0][2] + b1 * projected[1][2] + b2 * projected[2][2]
+            inv_w = b0 * ordered[0][2] + b1 * ordered[1][2] + b2 * ordered[2][2]
             camera_depth = 1.0 / inv_w
             uv_over_w = (
-                b0 * projected[0][3][0] + b1 * projected[1][3][0] + b2 * projected[2][3][0],
-                b0 * projected[0][3][1] + b1 * projected[1][3][1] + b2 * projected[2][3][1],
+                b0 * ordered[0][3][0] + b1 * ordered[1][3][0] + b2 * ordered[2][3][0],
+                b0 * ordered[0][3][1] + b1 * ordered[1][3][1] + b2 * ordered[2][3][1],
             )
-            opacity_over_w = b0 * projected[0][4] + b1 * projected[1][4] + b2 * projected[2][4]
+            opacity_over_w = b0 * ordered[0][4] + b1 * ordered[1][4] + b2 * ordered[2][4]
             color_over_w = tuple(
-                b0 * projected[0][5][channel] + b1 * projected[1][5][channel] + b2 * projected[2][5][channel]
+                b0 * ordered[0][5][channel] + b1 * ordered[1][5][channel] + b2 * ordered[2][5][channel]
                 for channel in range(3)
             )
             uv = (uv_over_w[0] / inv_w, uv_over_w[1] / inv_w)
@@ -251,8 +294,31 @@ def render(scene: Scene, options: RenderOptions = RenderOptions()) -> Image:
     # Supported transparency: one source-over pass, per-fragment back-to-front.
     # Order-independent whole-surface blending (weighted OIT, refraction) is
     # intentionally out of scope.
-    transparent_fragments.sort(key=lambda item: item[2], reverse=True)
-    for x, y, fragment_depth, opacity, _, shaded in transparent_fragments:
+    transparent_fragments.sort(key=lambda item: (item[0], item[1], -item[2]))
+    # A physical surface may arrive as two coincident pieces (alternative
+    # diagonal, reversed submission, or triangles from separate meshes with
+    # shared vertices). After clipping their shared edge can differ by a
+    # rounding unit, so the top/left fill rule alone lets both pieces emit the
+    # seam pixel. Blending them twice brightens the line and re-applies the
+    # material; coalesce coincident fragments before compositing instead of
+    # hiding the edge. Fragments count as one surface point only when they
+    # share a pixel, the same camera depth, and the same material response,
+    # so genuinely stacked layers are kept separate.
+    coalesced: List[Fragment] = []
+    for fragment in transparent_fragments:
+        x, y, fragment_depth, opacity, uv, shaded = fragment
+        if coalesced and coalesced[-1][0] == x and coalesced[-1][1] == y:
+            previous = coalesced[-1]
+            same_depth = abs(previous[2] - fragment_depth) <= max(1.0e-6, 1.0e-5 * fragment_depth)
+            same_material = (
+                abs(previous[3] - opacity) <= 1.0e-7
+                and all(abs(previous[5][channel] - shaded[channel]) <= 1.0e-6 for channel in range(3))
+            )
+            if same_depth and same_material:
+                continue
+        coalesced.append(fragment)
+    coalesced.sort(key=lambda item: item[2], reverse=True)
+    for x, y, fragment_depth, opacity, _, shaded in coalesced:
         offset = y * options.width + x
         if fragment_depth >= depth[offset]:
             continue
