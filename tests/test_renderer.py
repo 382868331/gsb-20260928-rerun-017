@@ -4,8 +4,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from renderer import Camera, Mesh, RenderOptions, Scene, Triangle, render
+from renderer import Camera, Mesh, RenderOptions, Scene, Texture, Triangle, render
 from renderer.rasterizer import clip_triangle
+from scenes.texture_demo_scene import build_texture_demo_scene
 
 
 class RendererTests(unittest.TestCase):
@@ -87,6 +88,106 @@ class RendererTests(unittest.TestCase):
             after = render(loaded, options).pixels
         self.assertEqual(before, after)
         moved = render(scene, RenderOptions(57, 43, "moved")).pixels
+        self.assertNotEqual(before, moved)
+
+    def _textured_quad(self, name, columns, rows, flip):
+        from scenes.texture_demo_scene import _grid_mesh
+
+        texture = Texture.procedural(
+            "grid",
+            16,
+            16,
+            lambda x, y: (240, 240, 240, 255) if ((x // 4) + (y // 4)) % 2 == 0 else (30, 30, 30, 255),
+        )
+        mesh = _grid_mesh(
+            name,
+            [(-1.4, -1.0, 3.0), (1.4, -1.0, 3.0), (1.4, 1.0, 3.0), (-1.4, 1.0, 3.0)],
+            columns,
+            rows,
+            (255, 255, 255),
+            "grid",
+            diagonal_flip=flip,
+        )
+        return texture, mesh
+
+    def test_texture_is_independent_of_triangulation(self):
+        # Nested tessellations with collinear diagonals: the physical surface
+        # and UV mapping are identical, so perspective interpolation must be
+        # pixel-identical regardless of where the cuts fall.
+        texture_a, mesh_a = self._textured_quad("a", 2, 2, False)
+        texture_b, mesh_b = self._textured_quad("b", 4, 4, False)
+        scene_a = Scene("a", [mesh_a], [Camera("front", near=.1, far=10)], textures=[texture_a])
+        scene_b = Scene("b", [mesh_b], [Camera("front", near=.1, far=10)], textures=[texture_b])
+        options = RenderOptions(91, 67)
+        self.assertEqual(render(scene_a, options).pixels, render(scene_b, options).pixels)
+
+    def test_shared_edges_have_no_background_slivers(self):
+        texture, mesh = self._textured_quad("tessellated", 6, 4, True)
+        scene = Scene("seams", [mesh], [Camera("front", near=.1, far=10)], background=(0, 0, 0), textures=[texture])
+        image = render(scene, RenderOptions(120, 90))
+        # Quad corners are fully inside the frame; interior must contain no
+        # background pixels (a seam would show as background on shared edges).
+        interior = [
+            image.get_pixel(x, y)
+            for y in range(14, 75)
+            for x in range(18, 102)
+        ]
+        self.assertNotIn((0, 0, 0), interior)
+
+    def test_textured_near_clipping_interpolates_uv_correctly(self):
+        texture, _ = self._textured_quad("grid", 1, 1, False)
+        mesh = Mesh(
+            "crossing",
+            [(-3, -3, .1), (3, -3, 3.0), (3, 3, 3.0), (-3, 3, .1)],
+            [Triangle((0, 1, 2), (255, 255, 255)), Triangle((0, 2, 3), (255, 255, 255))],
+            uvs=[(0, 0), (1, 0), (1, 1), (0, 1)],
+            texture_name="grid",
+        )
+        scene = Scene("near", [mesh], [Camera("front", near=.8, far=10)], background=(0, 0, 0), textures=[texture])
+        image = render(scene, RenderOptions(64, 64))
+        # Near-clipped surface is textured (not flat white) and has no seam hole.
+        colors = set(image.pixels)
+        self.assertIn((240, 240, 240), colors)
+        self.assertTrue(any(pixel == (30, 30, 30) for pixel in colors))
+        background_count = sum(1 for pixel in image.pixels if pixel == (0, 0, 0))
+        self.assertLess(background_count, 8)
+
+    def test_translucent_sheets_over_blend_in_depth_order(self):
+        base = Mesh.quad("base", [(-1, -1, 4), (1, -1, 4), (1, 1, 4), (-1, 1, 4)], (0, 0, 0))
+        back = Mesh.quad("back", [(-1, -1, 3), (1, -1, 3), (1, 1, 3), (-1, 1, 3)], (0, 200, 0), opacity=.5)
+        front = Mesh.quad("front", [(-1, -1, 2), (1, -1, 2), (1, 1, 2), (-1, 1, 2)], (200, 0, 0), opacity=.5)
+        scene = Scene("blend", [base, back, front], [Camera("front", near=.1, far=10)])
+        image = render(scene, RenderOptions(21, 21))
+        # Over black: back green then front red. Order-independent for these
+        # two over black, so also verify closer opaque occluder wins.
+        self.assertEqual(image.get_pixel(10, 10), (100, 50, 0))
+
+    def test_opaque_geometry_occludes_translucent_behind(self):
+        back_sheet = Mesh.quad("sheet", [(-1, -1, 4), (1, -1, 4), (1, 1, 4), (-1, 1, 4)], (0, 255, 0), opacity=.5)
+        blocker = Mesh.quad("blocker", [(-.5, -.5, 3), (.5, -.5, 3), (.5, .5, 3), (-.5, .5, 3)], (255, 0, 0))
+        scene = Scene("occlude", [back_sheet, blocker], [Camera("front", near=.1, far=10)], background=(0, 0, 0))
+        image = render(scene, RenderOptions(21, 21))
+        self.assertEqual(image.get_pixel(10, 10), (255, 0, 0))
+        self.assertEqual(image.get_pixel(4, 10), (0, 128, 0))
+
+    def test_translucent_in_front_tints_opaque(self):
+        blocker = Mesh.quad("blocker", [(-1, -1, 4), (1, -1, 4), (1, 1, 4), (-1, 1, 4)], (255, 0, 0))
+        sheet = Mesh.quad("sheet", [(-1, -1, 3), (1, -1, 3), (1, 1, 3), (-1, 1, 3)], (0, 0, 255), opacity=.5)
+        scene = Scene("tint", [blocker, sheet], [Camera("front", near=.1, far=10)])
+        image = render(scene, RenderOptions(21, 21))
+        self.assertIn(image.get_pixel(10, 10), ((128, 0, 128), (128, 0, 127), (127, 0, 128), (127, 0, 127)))
+
+    def test_textured_scene_round_trips_and_changes_with_camera(self):
+        scene = build_texture_demo_scene()
+        options = RenderOptions(128, 96, "front")
+        before = render(scene, options).pixels
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "textured.json"
+            scene.save(path)
+            loaded = Scene.load(path)
+            after = render(loaded, options).pixels
+        self.assertEqual(before, after)
+        moved = render(scene, RenderOptions(128, 96, "moved")).pixels
         self.assertNotEqual(before, moved)
 
 
