@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from renderer import RenderOptions, Scene, render
+from renderer import RenderOptions, Scene, render_with_report
 
 
 def main() -> None:
@@ -16,9 +16,19 @@ def main() -> None:
     args = parser.parse_args()
 
     scene = Scene.load(args.scene)
-    image = render(scene, RenderOptions(args.width, args.height, args.camera))
+    image, report = render_with_report(scene, RenderOptions(args.width, args.height, args.camera))
     image.save_png(args.output)
     print(f"rendered {args.output} with camera {scene.camera(args.camera).name}")
+    for section in report.sections:
+        print(
+            f"  section: mesh={section.mesh_name} plane={section.plane_name} "
+            f"loops={section.loop_count} vertices={section.vertex_count} color={section.color}"
+        )
+    for gap in report.gaps:
+        print(
+            f"  gap: mesh={gap.mesh_name} plane={gap.plane_name} "
+            f"open chain {gap.start} -> {gap.end} length={gap.length:.4f} (not filled)"
+        )
 
 
 if __name__ == "__main__":

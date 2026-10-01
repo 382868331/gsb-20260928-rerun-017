@@ -5,9 +5,11 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .camera import Camera
+from .clip_plane import ClipPlane
 from .geometry import Mesh
 from .image import Image
 from .scene import Scene
+from .section import GapInfo, RenderReport, SectionInfo, extract_section
 from .texture import Texture
 
 
@@ -246,6 +248,176 @@ def _shade(fragment: Fragment, texture: Optional[Texture]) -> Tuple[float, float
 
 
 def render(scene: Scene, options: RenderOptions = RenderOptions()) -> Image:
+    image, _ = render_with_report(scene, options)
+    return image
+
+
+def _world_scale(scene: Scene) -> float:
+    extent = 1.0
+    for mesh in scene.meshes:
+        for vertex in mesh.vertices:
+            extent = max(extent, abs(vertex[0]), abs(vertex[1]), abs(vertex[2]))
+    return extent
+
+
+def _clip_polygon_world(
+    polygon: List[Tuple[Tuple[float, float, float], Tuple[float, float]]],
+    plane: ClipPlane,
+    epsilon: float,
+) -> List[Tuple[Tuple[float, float, float], Tuple[float, float]]]:
+    """Sutherland-Hodgman against one world-space plane; keeps the keep side."""
+    clipped: List[Tuple[Tuple[float, float, float], Tuple[float, float]]] = []
+
+    def lerp_corner(a, b, t):
+        position = tuple(a[0][k] + (b[0][k] - a[0][k]) * t for k in range(3))
+        uv = (a[1][0] + (b[1][0] - a[1][0]) * t, a[1][1] + (b[1][1] - a[1][1]) * t)
+        return position, uv
+
+    previous = polygon[-1]
+    previous_distance = plane.signed_distance(previous[0])
+    for current in polygon:
+        current_distance = plane.signed_distance(current[0])
+        current_inside = current_distance >= -epsilon
+        previous_inside = previous_distance >= -epsilon
+        if current_inside:
+            if not previous_inside:
+                t = previous_distance / (previous_distance - current_distance)
+                clipped.append(lerp_corner(previous, current, min(1.0, max(0.0, t))))
+            clipped.append(current)
+        elif previous_inside:
+            t = previous_distance / (previous_distance - current_distance)
+            clipped.append(lerp_corner(previous, current, min(1.0, max(0.0, t))))
+        previous = current
+        previous_distance = current_distance
+    return clipped
+
+
+def _clip_loop_near(points, near):
+    clipped = []
+    previous = points[-1]
+    for current in points:
+        if current[2] >= near:
+            if previous[2] < near:
+                t = (near - previous[2]) / (current[2] - previous[2])
+                clipped.append(tuple(previous[k] + (current[k] - previous[k]) * t for k in range(3)))
+            clipped.append(current)
+        elif previous[2] >= near:
+            t = (near - previous[2]) / (current[2] - previous[2])
+            clipped.append(tuple(previous[k] + (current[k] - previous[k]) * t for k in range(3)))
+        previous = current
+    return clipped
+
+
+def _inside_evenodd(x: float, y: float, loop) -> bool:
+    inside = False
+    x0, y0 = loop[-1]
+    for x1, y1 in loop:
+        if (y0 > y) != (y1 > y):
+            crossing = x0 + (x1 - x0) * (y - y0) / (y1 - y0)
+            if x < crossing:
+                inside = not inside
+        x0, y0 = x1, y1
+    return inside
+
+
+def _render_sections(
+    scene: Scene,
+    camera: Camera,
+    planes: List[ClipPlane],
+    scale: float,
+    image: Image,
+    depth: List[float],
+    options: RenderOptions,
+    report: RenderReport,
+) -> None:
+    """Draw one opaque section face per (mesh, plane) into the depth buffer.
+
+    Each closed loop set is filled with an even-odd rule so internal holes
+    stay empty; open chains are reported as gaps instead of being closed.
+    Sections are computed per mesh, so intersecting transparent objects keep
+    separately traceable caps that depth-test against each other.
+    """
+    tan_half = math.tan(math.radians(camera.fov_y_degrees) * 0.5)
+    aspect_ratio = options.width / options.height
+    right, camera_up, forward = camera.frame()
+    eye = camera.eye
+    width, height = options.width, options.height
+    for mesh in scene.meshes:
+        for plane in planes:
+            loops, gaps = extract_section(mesh, plane, scale)
+            report.gaps.extend(gaps)
+            if not loops:
+                continue
+            report.sections.append(
+                SectionInfo(
+                    mesh.name,
+                    plane.name,
+                    len(loops),
+                    sum(len(loop) for loop in loops),
+                    plane.section_color,
+                )
+            )
+            normal_camera = (
+                sum(plane.normal[k] * right[k] for k in range(3)),
+                sum(plane.normal[k] * camera_up[k] for k in range(3)),
+                sum(plane.normal[k] * forward[k] for k in range(3)),
+            )
+            offset_camera = sum(plane.normal[k] * (eye[k] - plane.point[k]) for k in range(3))
+            screen_loops = []
+            for loop in loops:
+                camera_points = [camera.view_position(point) for point in loop]
+                camera_points = _clip_loop_near(camera_points, camera.near)
+                if len(camera_points) < 3:
+                    continue
+                screen_loop = []
+                for x, y, z in camera_points:
+                    ndc_x = x / (z * tan_half * aspect_ratio)
+                    ndc_y = y / (z * tan_half)
+                    screen_loop.append(((ndc_x + 1.0) * 0.5 * width, (1.0 - ndc_y) * 0.5 * height))
+                screen_loops.append(screen_loop)
+            if not screen_loops:
+                continue
+            min_x = max(0, int(math.floor(min(p[0] for loop in screen_loops for p in loop) - 0.5)))
+            max_x = min(width - 1, int(math.ceil(max(p[0] for loop in screen_loops for p in loop) - 0.5)))
+            min_y = max(0, int(math.floor(min(p[1] for loop in screen_loops for p in loop) - 0.5)))
+            max_y = min(height - 1, int(math.ceil(max(p[1] for loop in screen_loops for p in loop) - 0.5)))
+            other_planes = [other for other in planes if other is not plane]
+            for pixel_y in range(min_y, max_y + 1):
+                for pixel_x in range(min_x, max_x + 1):
+                    sample = (pixel_x + 0.5, pixel_y + 0.5)
+                    inside = False
+                    for screen_loop in screen_loops:
+                        if _inside_evenodd(sample[0], sample[1], screen_loop):
+                            inside = not inside
+                    if not inside:
+                        continue
+                    ndc_x = (pixel_x + 0.5) / width * 2.0 - 1.0
+                    ndc_y = 1.0 - (pixel_y + 0.5) / height * 2.0
+                    direction = (ndc_x * tan_half * aspect_ratio, ndc_y * tan_half, 1.0)
+                    denominator = sum(normal_camera[k] * direction[k] for k in range(3))
+                    if abs(denominator) < 1e-12:
+                        continue
+                    t = -offset_camera / denominator
+                    if t < camera.near or t > camera.far:
+                        continue
+                    hit_world = tuple(
+                        eye[k]
+                        + right[k] * direction[0] * t
+                        + camera_up[k] * direction[1] * t
+                        + forward[k] * t
+                        for k in range(3)
+                    )
+                    if any(
+                        other.signed_distance(hit_world) < -1e-7 * scale for other in other_planes
+                    ):
+                        continue
+                    offset = pixel_y * width + pixel_x
+                    if t < depth[offset]:
+                        image.set_pixel(pixel_x, pixel_y, plane.section_color)
+                        depth[offset] = t
+
+
+def render_with_report(scene: Scene, options: RenderOptions = RenderOptions()):
     camera = scene.camera(options.camera_name)
     image = Image(options.width, options.height, scene.background)
     # Camera-space depth (larger = farther) keeps opaque/transparent ordering
@@ -253,6 +425,9 @@ def render(scene: Scene, options: RenderOptions = RenderOptions()) -> Image:
     depth = [math.inf for _ in range(options.width * options.height)]
     aspect_ratio = options.width / options.height
     transparent_fragments: List[Fragment] = []
+    planes = [plane for plane in scene.clip_planes if plane.enabled]
+    world_scale = _world_scale(scene)
+    clip_epsilon = 1e-9 * world_scale
 
     for mesh in scene.meshes:
         textures: Dict[str, Texture] = {}
@@ -260,36 +435,59 @@ def render(scene: Scene, options: RenderOptions = RenderOptions()) -> Image:
             textures = {texture.name: texture for texture in mesh.textures}
         for triangle in mesh.triangles:
             texture = textures.get(triangle.texture_name) if triangle.texture_name is not None else None
-            source_vertices = []
-            for corner, index in enumerate(triangle.indices):
-                uv = triangle.uvs[corner] if triangle.uvs is not None else (0.0, 0.0)
-                vertex = _clip_vertex(
-                    camera,
-                    mesh.vertices[index],
-                    tuple(float(channel) for channel in triangle.color),
-                    aspect_ratio,
-                    uv[0],
-                    uv[1],
-                    triangle.opacity,
-                )
-                source_vertices.append(vertex)
-            for clipped_triangle in clip_triangle(source_vertices):
-                projected = [_project_vertex(vertex, options.width, options.height) for vertex in clipped_triangle]
-                fragments = _collect_fragments(projected, options.width, options.height)
-                if triangle.opacity >= 1.0:
-                    for fragment in fragments:
-                        x, y, fragment_depth, _, _, _ = fragment
-                        offset = y * options.width + x
-                        if fragment_depth < depth[offset]:
-                            image.set_pixel(x, y, _shade(fragment, texture))
-                            depth[offset] = fragment_depth
-                else:
-                    for fragment in fragments:
-                        x, y, fragment_depth, opacity, uv, color = fragment
-                        if fragment_depth < depth[y * options.width + x]:
-                            transparent_fragments.append(
-                                (x, y, fragment_depth, opacity, uv, _shade(fragment, texture))
-                            )
+            default_uvs = ((0.0, 0.0), (0.0, 0.0), (0.0, 0.0))
+            uvs = triangle.uvs if triangle.uvs is not None else default_uvs
+            polygon = [
+                (mesh.vertices[index], uvs[corner]) for corner, index in enumerate(triangle.indices)
+            ]
+            for plane in planes:
+                polygon = _clip_polygon_world(polygon, plane, clip_epsilon)
+                if len(polygon) < 3:
+                    break
+            if len(polygon) < 3:
+                continue
+            # Canonical fan pivot so the decomposition does not depend on the
+            # incoming corner order of the clipped polygon.
+            pivot = min(range(len(polygon)), key=lambda i: polygon[i][0])
+            ordered = polygon[pivot:] + polygon[:pivot]
+            for fan_index in range(1, len(ordered) - 1):
+                corners = (ordered[0], ordered[fan_index], ordered[fan_index + 1])
+                source_vertices = []
+                for position, uv in corners:
+                    vertex = _clip_vertex(
+                        camera,
+                        position,
+                        tuple(float(channel) for channel in triangle.color),
+                        aspect_ratio,
+                        uv[0],
+                        uv[1],
+                        triangle.opacity,
+                    )
+                    source_vertices.append(vertex)
+                for clipped_triangle in clip_triangle(source_vertices):
+                    projected = [
+                        _project_vertex(vertex, options.width, options.height)
+                        for vertex in clipped_triangle
+                    ]
+                    fragments = _collect_fragments(projected, options.width, options.height)
+                    if triangle.opacity >= 1.0:
+                        for fragment in fragments:
+                            x, y, fragment_depth, _, _, _ = fragment
+                            offset = y * options.width + x
+                            if fragment_depth < depth[offset]:
+                                image.set_pixel(x, y, _shade(fragment, texture))
+                                depth[offset] = fragment_depth
+                    else:
+                        for fragment in fragments:
+                            x, y, fragment_depth, opacity, uv, color = fragment
+                            if fragment_depth < depth[y * options.width + x]:
+                                transparent_fragments.append(
+                                    (x, y, fragment_depth, opacity, uv, _shade(fragment, texture))
+                                )
+
+    report = RenderReport()
+    if planes:
+        _render_sections(scene, camera, planes, world_scale, image, depth, options, report)
 
     # Supported transparency: one source-over pass, per-fragment back-to-front.
     # Order-independent whole-surface blending (weighted OIT, refraction) is
@@ -325,4 +523,4 @@ def render(scene: Scene, options: RenderOptions = RenderOptions()) -> Image:
         base = image.get_pixel(x, y)
         blended = tuple(base[channel] * (1.0 - opacity) + shaded[channel] * opacity for channel in range(3))
         image.set_pixel(x, y, blended)
-    return image
+    return image, report

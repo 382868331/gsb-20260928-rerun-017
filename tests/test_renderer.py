@@ -4,8 +4,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from renderer import Camera, Mesh, RenderOptions, Scene, Triangle, render
+from renderer import Camera, ClipPlane, Mesh, RenderOptions, Scene, Triangle, render, render_with_report
 from renderer.rasterizer import clip_triangle
+from scenes.clip_scene import box_mesh, square_tube_mesh
 from scenes.texture_scene import (
     near_textured_scene,
     transparent_overlap_scene,
@@ -220,6 +221,170 @@ class RendererTests(unittest.TestCase):
         reference = render(Scene("layers", variants["diagonal_a"] + red, [camera], background=(10, 10, 24)), options).pixels
         split = render(Scene("layers", variants["split_meshes"] + red, [camera], background=(10, 10, 24)), options).pixels
         self.assertEqual(reference, split)
+
+
+class ClipPlaneTests(unittest.TestCase):
+    SECTION = (250, 205, 60)
+    SECTION_B = (90, 220, 235)
+
+    def _scene(self, meshes, planes, cameras=None):
+        cameras = cameras or [Camera("front", eye=(-2.0, 0.6, 0.5), target=(0, 0, 3), near=0.1, far=25)]
+        return Scene("clip", meshes, cameras, background=(0, 0, 0), clip_planes=planes)
+
+    def _color_pixels(self, image, color):
+        return {i for i, pixel in enumerate(image.pixels) if pixel == color}
+
+    def test_cut_shows_distinct_traceable_section(self):
+        box = box_mesh("box-a", (0, 0, 3), (1, 1, 1), (80, 150, 220), opacity=0.5)
+        plane = ClipPlane("cut", (0, 0, 0), (1, 0, 0), self.SECTION)
+        image, report = render_with_report(self._scene([box], [plane]), RenderOptions(60, 60))
+        self.assertIn(self.SECTION, image.pixels)
+        self.assertEqual(
+            [(s.mesh_name, s.plane_name) for s in report.sections],
+            [("box-a", "cut")],
+        )
+        self.assertEqual(report.gaps, [])
+
+    def test_section_identical_under_alternative_triangulation(self):
+        plane = ClipPlane("cut", (0.1, 0.05, 0), (1, 0.4, 0.2), self.SECTION)
+        options = RenderOptions(80, 60)
+        caps = []
+        reports = []
+        for diagonal in (0, 1):
+            box = box_mesh("box", (0, 0, 3), (1.2, 1.0, 0.8), (80, 150, 220), 0.5, diagonal)
+            image, report = render_with_report(self._scene([box], [plane]), options)
+            caps.append(self._color_pixels(image, self.SECTION))
+            reports.append(report)
+        self.assertTrue(caps[0])
+        # The section face itself is bit-identical across triangulations.
+        self.assertEqual(caps[0], caps[1])
+        summary = [
+            [(s.mesh_name, s.plane_name, s.loop_count, s.color) for s in report.sections]
+            for report in reports
+        ]
+        self.assertEqual(summary[0], summary[1])
+        self.assertEqual(reports[0].gaps, reports[1].gaps)
+
+    def test_plane_on_face_and_vertex_does_not_flicker(self):
+        options = RenderOptions(60, 60)
+        counts = []
+        renders = []
+        for offset in (0.0, -1e-7, -2e-7):
+            box = box_mesh("box", (0, 0, 3), (1, 1, 1), (80, 150, 220), 0.5)
+            plane = ClipPlane("cut", (0.5 + offset, 0, 0), (1, 0, 0), self.SECTION)
+            image, report = render_with_report(self._scene([box], [plane]), options)
+            self.assertEqual(report.gaps, [])
+            counts.append(len(self._color_pixels(image, self.SECTION)))
+            renders.append(image.pixels)
+        # Plane resting exactly on the box face renders the same cap as an
+        # infinitesimally inward plane: no sudden fill, no flicker.
+        self.assertEqual(renders[0], renders[1])
+        self.assertEqual(renders[1], renders[2])
+        self.assertGreater(counts[0], 0)
+
+    def test_plane_through_corner_vertex_stays_stable(self):
+        options = RenderOptions(60, 60)
+        normal = (1.0, 1.0, 1.0)
+        corner = (0.5, 0.5, 3.5)
+        counts = []
+        for delta in (0.0, -1e-7, 1e-7):
+            box = box_mesh("box", (0, 0, 3), (1, 1, 1), (80, 150, 220), 0.5)
+            point = tuple(corner[k] + delta for k in range(3))
+            plane = ClipPlane("cut", point, normal, self.SECTION)
+            _, report = render_with_report(self._scene([box], [plane]), options)
+            image, _ = render_with_report(self._scene([box], [plane]), options)
+            self.assertEqual(report.gaps, [])
+            counts.append(len(self._color_pixels(image, self.SECTION)))
+        self.assertLessEqual(max(counts) - min(counts), 1)
+
+    def test_internal_hole_stays_empty(self):
+        tube = square_tube_mesh("tube", (0, 0, 3), 0.7, 0.5, 0.25, (230, 170, 90), 0.6)
+        plane = ClipPlane("cut", (0, 0, 3), (0, 0, 1), self.SECTION)
+        camera = Camera("front", eye=(0, 0, 0), target=(0, 0, 1), near=0.1, far=20)
+        image, report = render_with_report(self._scene([tube], [plane], [camera]), RenderOptions(80, 80))
+        self.assertEqual(report.gaps, [])
+        self.assertEqual(len(report.sections), 1)
+        self.assertEqual(report.sections[0].loop_count, 2)  # outer + inner boundary
+        self.assertEqual(image.get_pixel(40, 40), (0, 0, 0))  # bore stays empty
+        self.assertIn(self.SECTION, image.pixels)  # annulus ring is filled
+
+    def test_open_surface_reports_gap_instead_of_filling(self):
+        panel = Mesh.quad(
+            "panel",
+            [(-1, -1, 3), (1, -1, 3), (1, 1, 3), (-1, 1, 3)],
+            (200, 120, 220),
+            opacity=0.5,
+        )
+        plane = ClipPlane("cut", (0, 0, 0), (1, 0, 0), self.SECTION)
+        image, report = render_with_report(self._scene([panel], [plane]), RenderOptions(60, 60))
+        self.assertEqual(report.sections, [])
+        self.assertEqual(len(report.gaps), 1)
+        gap = report.gaps[0]
+        self.assertEqual((gap.mesh_name, gap.plane_name), ("panel", "cut"))
+        self.assertAlmostEqual(gap.length, 2.0, places=3)
+        self.assertNotIn(self.SECTION, image.pixels)
+
+    def test_intersecting_transparent_objects_keep_separate_sections(self):
+        box_a = box_mesh("box-a", (-0.3, 0, 3), (1, 1, 1), (80, 150, 220), 0.5)
+        box_b = box_mesh("box-b", (0.3, 0, 3), (1, 1, 1), (120, 220, 140), 0.5)
+        plane = ClipPlane("cut", (0, 0, 0), (1, 0, 0), self.SECTION)
+        image, report = render_with_report(self._scene([box_a, box_b], [plane]), RenderOptions(60, 60))
+        sources = {(s.mesh_name, s.plane_name) for s in report.sections}
+        self.assertEqual(sources, {("box-a", "cut"), ("box-b", "cut")})
+        self.assertIn(self.SECTION, image.pixels)
+
+    def test_two_planes_have_independent_colors(self):
+        def build(color_a):
+            box = box_mesh("box", (0, 0, 3), (1.2, 1.2, 1.2), (80, 150, 220), 0.5)
+            planes = [
+                ClipPlane("cut-x", (0, 0, 0), (1, 0, 0), color_a),
+                ClipPlane("cut-y", (0, -0.2, 0), (0, 1, 0), self.SECTION_B),
+            ]
+            return self._scene([box], planes)
+
+        options = RenderOptions(80, 80)
+        image_a, report_a = render_with_report(build(self.SECTION), options)
+        recolored = (240, 80, 80)
+        image_b, report_b = render_with_report(build(recolored), options)
+        # Recoloring cut-x leaves every cut-y section pixel untouched.
+        self.assertEqual(
+            self._color_pixels(image_a, self.SECTION_B),
+            self._color_pixels(image_b, self.SECTION_B),
+        )
+        self.assertTrue(self._color_pixels(image_a, self.SECTION))
+        self.assertEqual(
+            self._color_pixels(image_a, self.SECTION),
+            self._color_pixels(image_b, recolored),
+        )
+        self.assertEqual(
+            {(s.mesh_name, s.plane_name) for s in report_a.sections},
+            {(s.mesh_name, s.plane_name) for s in report_b.sections},
+        )
+
+    def test_section_visible_from_both_sides_and_after_reload(self):
+        cameras = [
+            Camera("west", eye=(-4, 0.3, 3), target=(0, 0, 3), near=0.1, far=20),
+            Camera("east", eye=(4, 0.3, 3), target=(0, 0, 3), near=0.1, far=20),
+        ]
+        box = box_mesh("box", (0, 0, 3), (1, 1, 1), (80, 150, 220), 0.5)
+        plane = ClipPlane("cut", (0, 0, 0), (1, 0, 0), self.SECTION)
+        scene = self._scene([box], [plane], cameras)
+        west = render(scene, RenderOptions(80, 80, "west"))
+        east = render(scene, RenderOptions(80, 80, "east"))
+        # From the removed side the opaque cap is seen directly; from the
+        # kept side the remaining transparent shell blends over it. Both are
+        # the same depth order evaluated from two cameras.
+        self.assertEqual(west.get_pixel(40, 40), self.SECTION)
+        self.assertIn(self.SECTION, west.pixels)
+        self.assertNotIn((0, 0, 0), [east.get_pixel(40, 40)])
+        self.assertNotEqual(east.get_pixel(40, 40), self.SECTION)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "clip.json"
+            scene.save(path)
+            reloaded = Scene.load(path)
+            self.assertEqual(len(reloaded.clip_planes), 1)
+            again = render(reloaded, RenderOptions(80, 80, "west"))
+        self.assertEqual(west.pixels, again.pixels)
 
 
 if __name__ == "__main__":

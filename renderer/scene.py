@@ -5,21 +5,31 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 from .camera import Camera
+from .clip_plane import ClipPlane
 from .geometry import Mesh
 
 
 class Scene:
-    def __init__(self, name: str, meshes: Iterable[Mesh], cameras: Iterable[Camera], background=(12, 14, 20)):
+    def __init__(
+        self,
+        name: str,
+        meshes: Iterable[Mesh],
+        cameras: Iterable[Camera],
+        background=(12, 14, 20),
+        clip_planes: Iterable[ClipPlane] = (),
+    ):
         self.name = name
         self.meshes = list(meshes)
         self.cameras = list(cameras)
         self.background = tuple(background)
+        self.clip_planes = list(clip_planes)
         if not self.cameras:
             raise ValueError("scene needs at least one camera")
         if len(self.background) != 3 or any(not 0 <= value <= 255 for value in self.background):
             raise ValueError("background must be three channels in [0, 255]")
         self._ensure_unique(mesh.name for mesh in self.meshes)
         self._ensure_unique(camera.name for camera in self.cameras)
+        self._ensure_unique(plane.name for plane in self.clip_planes)
 
     @staticmethod
     def _ensure_unique(names: Iterable[str]) -> None:
@@ -38,7 +48,7 @@ class Scene:
         raise KeyError(f"camera {name!r} is not in scene {self.name!r}")
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "format": "mini-offline-renderer-scene",
             "version": 1,
             "name": self.name,
@@ -46,6 +56,9 @@ class Scene:
             "cameras": [camera.to_dict() for camera in self.cameras],
             "meshes": [mesh.to_dict() for mesh in self.meshes],
         }
+        if self.clip_planes:
+            data["clip_planes"] = [plane.to_dict() for plane in self.clip_planes]
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "Scene":
@@ -58,6 +71,7 @@ class Scene:
             meshes=[Mesh.from_dict(item) for item in data["meshes"]],
             cameras=[Camera.from_dict(item) for item in data["cameras"]],
             background=tuple(data.get("background", (12, 14, 20))),
+            clip_planes=[ClipPlane.from_dict(item) for item in data.get("clip_planes", [])],
         )
 
     def save(self, path: str | Path) -> None:

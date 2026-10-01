@@ -11,8 +11,12 @@ A small dependency-free Python rasterizer. It converts triangle meshes through a
 - `renderer/image.py`: in-memory RGB image and PNG encoder.
 - `scenes/demo_scene.py`: overlap, camera-motion, partial off-screen, and near-crossing geometry.
 - `renderer/texture.py`: procedural textures with repeat-wrap nearest sampling.
+- `renderer/clip_plane.py`: named world-space clipping planes with per-plane section colors.
+- `renderer/section.py`: section-loop extraction, chaining, and the render report (sections and gaps).
 - `scenes/texture_scene.py`: alternative-diagonal, near-crossing textured, and overlapping translucent reference scenes.
+- `scenes/clip_scene.py`: intersecting transparent boxes, a hollow tube, and an open panel under three clip planes.
 - `make_feature_comparisons.py`: renders the texture/transparency comparison contact sheet entirely from scene math.
+- `make_clip_sections.py`: renders the clipping demo from three cameras and prints the section/gap report.
 - `make_seam_inspection.py`: local zoom across a transparent material/near-clip boundary for alternative diagonal and split-mesh submissions.
 - `tests/test_renderer.py`: pixel and clipping regression tests.
 
@@ -22,11 +26,21 @@ A small dependency-free Python rasterizer. It converts triangle meshes through a
 python make_demo_assets.py
 python make_feature_comparisons.py
 python make_seam_inspection.py
+python make_clip_sections.py
 python render_scene.py output/demo_scene.json output/custom.png --width 320 --height 240 --camera moved
 python -m unittest discover -s tests
 ```
 
 The demo writes a reusable JSON scene plus `front` and `moved` camera images in `output/`. Rendering uses only the Python standard library; no external renderer is used in the core pipeline.
+
+## Clipping planes and section faces
+- A scene may carry named `ClipPlane`s (kept side: dot(p - point, normal) non-negative). Several planes can stay active at once for side-by-side comparison; each plane owns its `section_color`, and recoloring one plane never affects another plane's section.
+- Triangles are clipped against every active plane in world space before projection, and the cut boundary of each mesh is closed with an opaque section face in the plane's section color, so the section reads distinctly from the transparent surfaces it interrupts.
+- Sections are extracted per mesh: the plane/triangle intersection segments of one object are chained into loops independently of every other object. Intersecting transparent objects therefore keep separate, source-traceable caps that depth-test against each other instead of merging into one source-less face. `render_with_report` returns a `RenderReport` listing every section with its source mesh and plane.
+- Loop sets are filled with an even-odd rule, so internal holes (for example the bore of a hollow tube) stay empty. Segment endpoints are snapped and quantized against scale-relative tolerances, so a plane resting exactly on a vertex or sliding along an existing edge produces the same closed loops as an infinitesimally offset plane: no sudden fills or flicker, and the section pixels are identical across alternative triangulations of the same model.
+- Section faces are written to the depth buffer before the transparent pass, so the occlusion order between caps and transparent surfaces is consistent from either side of the cut and after saving and reloading the scene (planes persist in the scene JSON).
+- Chains that cannot close (open surfaces, lengthwise cuts of open tubes) are not filled; they are reported as gaps with mesh, plane, endpoints, and length instead of being stitched into a fake closed face.
+
 
 ## Textures and transparency
 
