@@ -1,0 +1,118 @@
+{
+  "pair-a": {
+    "signature": "73ee6787cff5d8fd",
+    "report": {
+      "group": "pair-a",
+      "caps": [
+        {
+          "mesh": "tube",
+          "plane": "side-cut",
+          "closed": true,
+          "loops": 2,
+          "holes": 0,
+          "area": 1.2897651,
+          "open_segments": 0
+        },
+        {
+          "mesh": "box",
+          "plane": "front-cut",
+          "closed": true,
+          "loops": 1,
+          "holes": 0,
+          "area": 2.52,
+          "open_segments": 0
+        },
+        {
+          "mesh": "sheet",
+          "plane": "front-cut",
+          "closed": false,
+          "loops": 0,
+          "holes": 0,
+          "area": 0.0,
+          "open_segments": 1
+        },
+        {
+          "mesh": "sheet",
+          "plane": "side-cut",
+          "closed": false,
+          "loops": 0,
+          "holes": 0,
+          "area": 0.0,
+          "open_segments": 1
+        }
+      ],
+      "open_boundaries": [
+        {
+          "mesh": "sheet",
+          "plane": "front-cut",
+          "segments": 1
+        },
+        {
+          "mesh": "sheet",
+          "plane": "side-cut",
+          "segments": 1
+        }
+      ]
+    }
+  },
+  "pair-b": {
+    "signature": "e3ba39abe93fedc6",
+    "report": {
+      "group": "pair-b",
+      "caps": [
+        {
+          "mesh": "tube",
+          "plane": "side-cut",
+          "closed": true,
+          "loops": 2,
+          "holes": 0,
+          "area": 0.573229,
+          "open_segments": 0
+        },
+        {
+          "mesh": "box",
+          "plane": "front-cut",
+          "closed": true,
+          "loops": 1,
+          "holes": 0,
+          "area": 2.52,
+          "open_segments": 0
+        },
+        {
+          "mesh": "sheet",
+          "plane": "front-cut",
+          "closed": false,
+          "loops": 0,
+          "holes": 0,
+          "area": 0.0,
+          "open_segments": 1
+        },
+        {
+          "mesh": "sheet",
+          "plane": "side-cut",
+          "closed": false,
+          "loops": 0,
+          "holes": 0,
+          "area": 0.0,
+          "open_segments": 1
+        }
+      ],
+      "open_boundaries": [
+        {
+          "mesh": "sheet",
+          "plane": "front-cut",
+          "segments": 1
+        },
+        {
+          "mesh": "sheet",
+          "plane": "side-cut",
+          "segments": 1
+        }
+      ]
+    }
+  },
+  "triangulation_b_signatures": {
+    "pair-a": "73ee6787cff5d8fd",
+    "pair-b": "e3ba39abe93fedc6"
+  }
+}

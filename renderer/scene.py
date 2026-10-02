@@ -9,17 +9,31 @@ from .geometry import Mesh
 
 
 class Scene:
-    def __init__(self, name: str, meshes: Iterable[Mesh], cameras: Iterable[Camera], background=(12, 14, 20)):
+    def __init__(
+        self,
+        name: str,
+        meshes: Iterable[Mesh],
+        cameras: Iterable[Camera],
+        background=(12, 14, 20),
+        clip_groups=None,
+    ):
         self.name = name
         self.meshes = list(meshes)
         self.cameras = list(cameras)
         self.background = tuple(background)
+        from .section import ClipGroup
+
+        self.clip_groups = list(clip_groups) if clip_groups else []
+        for group in self.clip_groups:
+            if not isinstance(group, ClipGroup):
+                raise ValueError("clip_groups must contain ClipGroup objects")
         if not self.cameras:
             raise ValueError("scene needs at least one camera")
         if len(self.background) != 3 or any(not 0 <= value <= 255 for value in self.background):
             raise ValueError("background must be three channels in [0, 255]")
         self._ensure_unique(mesh.name for mesh in self.meshes)
         self._ensure_unique(camera.name for camera in self.cameras)
+        self._ensure_unique(group.name for group in self.clip_groups)
 
     @staticmethod
     def _ensure_unique(names: Iterable[str]) -> None:
@@ -38,26 +52,33 @@ class Scene:
         raise KeyError(f"camera {name!r} is not in scene {self.name!r}")
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "format": "mini-offline-renderer-scene",
-            "version": 1,
+            "version": 2 if self.clip_groups else 1,
             "name": self.name,
             "background": list(self.background),
             "cameras": [camera.to_dict() for camera in self.cameras],
             "meshes": [mesh.to_dict() for mesh in self.meshes],
         }
+        if self.clip_groups:
+            data["clip_groups"] = [group.to_dict() for group in self.clip_groups]
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "Scene":
         if data.get("format") != "mini-offline-renderer-scene":
             raise ValueError("unsupported scene format")
-        if data.get("version", 1) != 1:
+        if data.get("version", 1) not in (1, 2):
             raise ValueError("unsupported scene version")
+        from .section import ClipGroup
+
+        clip_groups = [ClipGroup.from_dict(item) for item in data.get("clip_groups", [])]
         return cls(
             name=data["name"],
             meshes=[Mesh.from_dict(item) for item in data["meshes"]],
             cameras=[Camera.from_dict(item) for item in data["cameras"]],
             background=tuple(data.get("background", (12, 14, 20))),
+            clip_groups=clip_groups,
         )
 
     def save(self, path: str | Path) -> None:
