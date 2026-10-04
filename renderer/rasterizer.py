@@ -9,6 +9,7 @@ from .geometry import Mesh
 from .image import Image
 from .scene import Scene
 from .texture import Texture
+from .section import ClipGroup, build_clipped_scene_meshes
 
 
 @dataclass(frozen=True)
@@ -16,6 +17,7 @@ class RenderOptions:
     width: int = 240
     height: int = 180
     camera_name: Optional[str] = None
+    clip_group_name: Optional[str] = None
 
 
 # Clip vertex layout:
@@ -247,6 +249,17 @@ def _shade(fragment: Fragment, texture: Optional[Texture]) -> Tuple[float, float
 
 def render(scene: Scene, options: RenderOptions = RenderOptions()) -> Image:
     camera = scene.camera(options.camera_name)
+    if options.clip_group_name is None and scene.clip_groups:
+        clip_group = scene.clip_groups[0]
+    elif options.clip_group_name is not None:
+        clip_group = scene.clip_group(options.clip_group_name)
+    else:
+        clip_group = None
+    render_meshes = (
+        build_clipped_scene_meshes(scene.meshes, clip_group)
+        if clip_group is not None
+        else scene.meshes
+    )
     image = Image(options.width, options.height, scene.background)
     # Camera-space depth (larger = farther) keeps opaque/transparent ordering
     # consistent after transparent pieces are split by the near plane.
@@ -254,7 +267,7 @@ def render(scene: Scene, options: RenderOptions = RenderOptions()) -> Image:
     aspect_ratio = options.width / options.height
     transparent_fragments: List[Fragment] = []
 
-    for mesh in scene.meshes:
+    for mesh in render_meshes:
         textures: Dict[str, Texture] = {}
         if mesh.textures:
             textures = {texture.name: texture for texture in mesh.textures}

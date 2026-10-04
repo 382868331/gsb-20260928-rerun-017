@@ -1,6 +1,6 @@
 {
   "format": "mini-offline-renderer-scene",
-  "version": 1,
+  "version": 2,
   "name": "triangle-pipeline-demo",
   "background": [
     12,

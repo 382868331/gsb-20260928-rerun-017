@@ -13,10 +13,15 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=240)
     parser.add_argument("--height", type=int, default=180)
     parser.add_argument("--camera", default=None, help="camera name; defaults to the first saved camera")
+    parser.add_argument(
+        "--clip-group",
+        default=None,
+        help="clip group name; defaults to the first group when the scene has one",
+    )
     args = parser.parse_args()
 
     scene = Scene.load(args.scene)
-    image = render(scene, RenderOptions(args.width, args.height, args.camera))
+    image = render(scene, RenderOptions(args.width, args.height, args.camera, args.clip_group))
     image.save_png(args.output)
     print(f"rendered {args.output} with camera {scene.camera(args.camera).name}")
 
