@@ -41,6 +41,28 @@ FRONT = Camera("front", eye=(0.0, -3.0, -6.0), target=(0, 0, 0), near=0.1, far=3
 BACK = Camera("back", eye=(0.0, 3.0, 6.0), target=(0, 0, 0), near=0.1, far=30)
 
 
+def _fill_area(mesh):
+    total = 0.0
+    for tri in mesh.triangles:
+        a, b, c = (mesh.vertices[i] for i in tri.indices)
+        u = [b[k] - a[k] for k in range(3)]
+        v = [c[k] - a[k] for k in range(3)]
+        cx = u[1] * v[2] - u[2] * v[1]
+        cy = u[2] * v[0] - u[0] * v[2]
+        cz = u[0] * v[1] - u[1] * v[0]
+        total += 0.5 * (cx * cx + cy * cy + cz * cz) ** 0.5
+    return total
+
+
+def _joint_box_group():
+    # Closed box [-1, 1]^3 kept where x <= 0.3 and y <= 0.2: the two
+    # section faces are rectangles of area 1.2*2 = 2.4 and 1.3*2 = 2.6.
+    return ClipGroup("g", [
+        ClipPlane.through("px", (-1, 0, 0), (0.3, 0, 0)),
+        ClipPlane.through("py", (0, -1, 0), (0, 0.2, 0)),
+    ])
+
+
 class TriangulationTests(unittest.TestCase):
     def test_hole_interior_is_never_filled(self):
         outer = [(0, 0), (10, 0), (10, 10), (0, 10)]
@@ -95,6 +117,39 @@ class SinglePlaneTests(unittest.TestCase):
 
 
 class JointPlaneTests(unittest.TestCase):
+    def _assert_joint_box_caps(self, derived, report):
+        caps = {c.plane: c for c in report.caps if c.closed}
+        self.assertAlmostEqual(caps["px"].area, 2.4, places=6)
+        self.assertAlmostEqual(caps["py"].area, 2.6, places=6)
+        for plane_name, expected in (("px", 2.4), ("py", 2.6)):
+            mesh = next(m for m in derived.meshes if m.name == f"box::cap::g::{plane_name}")
+            # The actual triangle fill matches the reported outline area:
+            # no overlap (fill <= outline) and no gap (fill >= outline).
+            self.assertAlmostEqual(_fill_area(mesh), expected, places=6)
+            # Every cap triangle centroid stays inside both kept half spaces.
+            for tri in mesh.triangles:
+                centroid = tuple(
+                    sum(mesh.vertices[i][k] for i in tri.indices) / 3 for k in range(3)
+                )
+                self.assertLessEqual(centroid[0], 0.3 + 1e-6)
+                self.assertLessEqual(centroid[1], 0.2 + 1e-6)
+
+    def test_joint_caps_fill_matches_reported_outline(self):
+        group = _joint_box_group()
+        scene = Scene("s", [box()], [FRONT], clip_groups=[group])
+        derived, report = apply_clip_group(scene, group)
+        self._assert_joint_box_caps(derived, report)
+        self.assertEqual(report.open_boundaries, [])
+
+    def test_joint_caps_are_plane_order_independent(self):
+        group = _joint_box_group()
+        swapped = group.copy_with(planes=list(reversed(group.planes)))
+        scene = Scene("s", [box()], [FRONT], clip_groups=[group])
+        derived_a, report_a = apply_clip_group(scene, group)
+        derived_b, report_b = apply_clip_group(scene, swapped)
+        self._assert_joint_box_caps(derived_b, report_b)
+        self.assertEqual(section_signature(report_a), section_signature(report_b))
+
     def test_two_joint_planes_keep_independent_caps_and_holes(self):
         scene = build_section_scene()
         group = scene.clip_groups[0]
@@ -128,6 +183,29 @@ class JointPlaneTests(unittest.TestCase):
 
 
 class OpenBoundaryTests(unittest.TestCase):
+    def test_annulus_cap_fill_matches_report_and_keeps_hole_empty(self):
+        import math
+
+        def ring_area(radius, sides=16):
+            return 0.5 * sides * radius * radius * math.sin(2 * math.pi / sides)
+
+        for diagonal_b in (False, True):
+            tube = hollow_tube("tube", diagonal_b=diagonal_b)
+            plane = ClipPlane.through("zcut", (0, 0, -1), (0, 0, 0.5))
+            group = ClipGroup("g", [plane])
+            scene = Scene("s", [tube], [FRONT], clip_groups=[group])
+            derived, report = apply_clip_group(scene, group)
+            cap = next(c for c in report.caps if c.closed)
+            self.assertEqual((cap.loops, cap.holes), (1, 1))
+            expected = ring_area(1.0) - ring_area(0.45)
+            self.assertAlmostEqual(cap.area, expected, places=6)
+            mesh = next(m for m in derived.meshes if "::cap::" in m.name)
+            self.assertAlmostEqual(_fill_area(mesh), expected, places=6)
+            for tri in mesh.triangles:
+                cx = sum(mesh.vertices[i][0] for i in tri.indices) / 3
+                cy = sum(mesh.vertices[i][1] for i in tri.indices) / 3
+                self.assertGreater((cx * cx + cy * cy) ** 0.5, 0.44)
+
     def test_open_sheet_reports_and_marks_uncloseable_range(self):
         scene = build_section_scene()
         group = scene.clip_groups[0]

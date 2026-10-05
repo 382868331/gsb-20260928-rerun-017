@@ -288,10 +288,12 @@ def _ear_clip_indices(ring: List[Tuple[float, float]]) -> List[int]:
     n = len(ring)
     if n < 3:
         return []
-    indices = list(range(n))
+    indices = _drop_collinear(ring, list(range(n)))
+    if len(indices) < 3:
+        return []
     triangles: List[int] = []
     guard = 0
-    expected = n - 2
+    expected = len(indices) - 2
     while len(indices) > 2 and guard < expected * 4 + 10:
         guard += 1
         clipped = False
@@ -328,6 +330,32 @@ def _ear_clip_indices(ring: List[Tuple[float, float]]) -> List[int]:
     return triangles
 
 
+def _drop_collinear(ring, indices):
+    # Remove vertices lying on the segment between their neighbours; they
+    # carry no outline information and would stall the ear clipper.
+    idx = list(indices)
+    changed = True
+    while changed and len(idx) > 3:
+        changed = False
+        for pos in range(len(idx)):
+            a = ring[idx[(pos - 1) % len(idx)]]
+            b = ring[idx[pos]]
+            c = ring[idx[(pos + 1) % len(idx)]]
+            cross2 = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+            lab = math.hypot(b[0] - a[0], b[1] - a[1])
+            lbc = math.hypot(c[0] - b[0], c[1] - b[1])
+            if lab <= 0.0 or lbc <= 0.0:
+                continue
+            if abs(cross2) > 1.0e-9 * lab * lbc:
+                continue
+            # Only drop genuine between-points, never spike tips.
+            if (b[0] - a[0]) * (c[0] - b[0]) + (b[1] - a[1]) * (c[1] - b[1]) >= 0.0:
+                del idx[pos]
+                changed = True
+                break
+    return idx
+
+
 def triangulate_2d_with_holes(
     outer: List[Tuple[float, float]], holes: List[List[Tuple[float, float]]]
 ) -> List[Tuple[int, int, int]]:
@@ -347,19 +375,21 @@ def triangulate_2d_with_holes(
             hole.reverse()
         normalized_holes.append(hole)
 
-    # Build a genuinely simple ring for *one* hole by sharing the bridge
-    # vertices (the hole's leftmost vertex is inserted at the anchor
-    # position, then the hole is walked and closed back at the anchor).
-    # Multiple holes are folded in one at a time: each produced fan is
-    # expressed against the growing simple boundary. For the geometries
-    # produced by plane cuts (a few convex section loops) this is exact; a
-    # final centroid/hole-membership filter guarantees no hole interior is
-    # ever filled even if a bridge candidate is awkward.
     if not normalized_holes:
         count = len(outer)
-        return [(i, i + 1, i + 2) for i in range(count - 2)] if count >= 3 else []
+        if count < 3:
+            return []
+        # Ear-clip the outer ring: a plain (i, i+1, i+2) walk is not a fan
+        # and both overlaps and leaves gaps on anything but a triangle.
+        flat = _ear_clip_indices(outer)
+        return [(flat[i], flat[i + 1], flat[i + 2]) for i in range(0, len(flat), 3)]
 
-    # Use a general incremental ear clipper over a shared-bridge ring.
+    # Fold each hole into the outer ring with a zero-width bridge: from the
+    # anchor vertex out to the hole's leftmost vertex, once around the hole,
+    # and straight back to the anchor. Anchor and hole entry point appear
+    # twice, so the result is one simple ring that the ear clipper can walk;
+    # the channel itself has zero area and never fills the hole. Multiple
+    # holes are folded in one at a time against the growing ring.
     ring2: List[Tuple[float, float]] = list(outer)
     # ring index -> global combined index
     ring_global: List[int] = list(range(len(outer)))
@@ -373,17 +403,24 @@ def triangulate_2d_with_holes(
             if ring2[i][0] <= h[0] + 1e-9
             else 1e30,
         )
-        # Insert: anchor, then hole vertices (the leftmost once, shared with
-        # the bridge), continuing around the hole.
-        ordered_local = [(h_local + k) % len(hole) for k in range(1, len(hole))]
+        base = hole_base + sum(len(x) for x in normalized_holes[:hole_number])
+        ordered_local = [(h_local + k) % len(hole) for k in range(len(hole))]
         insert_points = [hole[index] for index in ordered_local]
-        insert_globals = [hole_base + sum(len(x) for x in normalized_holes[:hole_number]) + index for index in ordered_local]
+        insert_points += [hole[h_local], ring2[candidate]]
+        insert_globals = [base + index for index in ordered_local]
+        insert_globals += [base + h_local, ring_global[candidate]]
         ring2[candidate + 1 : candidate + 1] = insert_points
         ring_global[candidate + 1 : candidate + 1] = insert_globals
 
     tris = _ear_clip_indices(ring2)
     accepted: List[Tuple[int, int, int]] = []
     for a, b, c in (tris[i : i + 3] for i in range(0, len(tris), 3)):
+        area2 = (
+            (ring2[b][0] - ring2[a][0]) * (ring2[c][1] - ring2[a][1])
+            - (ring2[b][1] - ring2[a][1]) * (ring2[c][0] - ring2[a][0])
+        )
+        if abs(area2) <= 1.0e-12:
+            continue
         centroid = (
             (ring2[a][0] + ring2[b][0] + ring2[c][0]) / 3.0,
             (ring2[a][1] + ring2[b][1] + ring2[c][1]) / 3.0,
