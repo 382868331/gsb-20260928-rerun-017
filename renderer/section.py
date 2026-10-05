@@ -289,6 +289,24 @@ def _ear_clip_indices(ring: List[Tuple[float, float]]) -> List[int]:
     if n < 3:
         return []
     indices = list(range(n))
+    # Drop collinear (zero-area) vertices first: they carry no area, and
+    # leaving them in can stall the ear search on a degenerate corner.
+    simplified = True
+    while simplified and len(indices) > 3:
+        simplified = False
+        for pos in range(len(indices)):
+            i_prev = indices[(pos - 1) % len(indices)]
+            i_cur = indices[pos]
+            i_next = indices[(pos + 1) % len(indices)]
+            a, b, c = ring[i_prev], ring[i_cur], ring[i_next]
+            cross2 = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+            if abs(cross2) <= 1e-12:
+                del indices[pos]
+                simplified = True
+                break
+    n = len(indices)
+    if n < 3:
+        return []
     triangles: List[int] = []
     guard = 0
     expected = n - 2
@@ -328,6 +346,39 @@ def _ear_clip_indices(ring: List[Tuple[float, float]]) -> List[int]:
     return triangles
 
 
+def _visible_anchor(ring, h, hole) -> Optional[int]:
+    """Nearest ring vertex mutually visible from hole vertex h: the segment
+    h->m crosses no ring or hole edge, and its midpoint lies inside the
+    ring and outside the hole."""
+    best = None
+    best_dist = None
+    for index, m in enumerate(ring):
+        if m == h:
+            continue
+        clear = True
+        for boundary in (ring, hole):
+            count = len(boundary)
+            for q in range(count):
+                p1 = boundary[q]
+                p2 = boundary[(q + 1) % count]
+                if p1 in (h, m) or p2 in (h, m):
+                    continue
+                if _segments_intersect(h, m, p1, p2):
+                    clear = False
+                    break
+            if not clear:
+                break
+        if not clear:
+            continue
+        midpoint = ((h[0] + m[0]) / 2.0, (h[1] + m[1]) / 2.0)
+        if not _point_in_ring(midpoint, ring) or _point_in_ring(midpoint, hole):
+            continue
+        dist = (h[0] - m[0]) ** 2 + (h[1] - m[1]) ** 2
+        if best is None or dist < best_dist:
+            best, best_dist = index, dist
+    return best
+
+
 def triangulate_2d_with_holes(
     outer: List[Tuple[float, float]], holes: List[List[Tuple[float, float]]]
 ) -> List[Tuple[int, int, int]]:
@@ -338,48 +389,74 @@ def triangulate_2d_with_holes(
     hole boundary, so real holes are never filled even under multi-plane
     cuts. Returns global indices into [outer, *holes]."""
     outer = list(outer)
+    # Normalize winding for the geometry, but remember the permutation so
+    # the returned indices still address the caller's original rings.
+    outer_perm = list(range(len(outer)))
     if _polygon_area2(outer) < 0.0:
         outer.reverse()
+        outer_perm = [len(outer) - 1 - i for i in range(len(outer))]
     normalized_holes = []
+    hole_perms = []
     for hole in holes:
         hole = list(hole)
+        perm = list(range(len(hole)))
         if _polygon_area2(hole) > 0.0:
             hole.reverse()
+            perm = [len(hole) - 1 - i for i in range(len(hole))]
         normalized_holes.append(hole)
+        hole_perms.append(perm)
+    # global_perm maps an index into the normalized [outer, *holes] layout
+    # back to the caller's original index space.
+    global_perm = list(outer_perm)
+    for hole, perm in zip(normalized_holes, hole_perms):
+        base = len(global_perm)
+        global_perm.extend(base + local for local in perm)
 
-    # Build a genuinely simple ring for *one* hole by sharing the bridge
-    # vertices (the hole's leftmost vertex is inserted at the anchor
-    # position, then the hole is walked and closed back at the anchor).
-    # Multiple holes are folded in one at a time: each produced fan is
-    # expressed against the growing simple boundary. For the geometries
-    # produced by plane cuts (a few convex section loops) this is exact; a
-    # final centroid/hole-membership filter guarantees no hole interior is
-    # ever filled even if a bridge candidate is awkward.
     if not normalized_holes:
         count = len(outer)
-        return [(i, i + 1, i + 2) for i in range(count - 2)] if count >= 3 else []
+        if count < 3:
+            return []
+        # Ear-clip the (possibly non-convex, possibly collinear-vertex) ring;
+        # a naive (i, i+1, i+2) strip overlaps itself and leaves gaps for
+        # any ring with more than four vertices.
+        clipped = _ear_clip_indices(outer)
+        if clipped:
+            return [
+                (outer_perm[clipped[i]], outer_perm[clipped[i + 1]], outer_perm[clipped[i + 2]])
+                for i in range(0, len(clipped), 3)
+            ]
+        # Convex fallback: a true fan around vertex 0.
+        return [(outer_perm[0], outer_perm[i + 1], outer_perm[i + 2]) for i in range(count - 2)]
 
-    # Use a general incremental ear clipper over a shared-bridge ring.
+    # Fold every hole into the outer ring with a proper bridge: from the
+    # hole's rightmost vertex to a mutually visible ring vertex, walk the
+    # hole, then return along the same channel. The merged ring is simple
+    # (the bridge is a zero-width channel traversed once in each direction),
+    # so ear clipping triangulates it exactly and holes stay empty.
     ring2: List[Tuple[float, float]] = list(outer)
     # ring index -> global combined index
     ring_global: List[int] = list(range(len(outer)))
     hole_base = len(outer)
     for hole_number, hole in enumerate(normalized_holes):
-        h_local = min(range(len(hole)), key=lambda i: (hole[i][0], hole[i][1]))
+        base = hole_base + sum(len(x) for x in normalized_holes[:hole_number])
+        h_local = max(range(len(hole)), key=lambda i: (hole[i][0], hole[i][1]))
         h = hole[h_local]
-        candidate = min(
-            range(len(ring2)),
-            key=lambda i: (h[0] - ring2[i][0]) ** 2 + (h[1] - ring2[i][1]) ** 2
-            if ring2[i][0] <= h[0] + 1e-9
-            else 1e30,
-        )
-        # Insert: anchor, then hole vertices (the leftmost once, shared with
-        # the bridge), continuing around the hole.
-        ordered_local = [(h_local + k) % len(hole) for k in range(1, len(hole))]
-        insert_points = [hole[index] for index in ordered_local]
-        insert_globals = [hole_base + sum(len(x) for x in normalized_holes[:hole_number]) + index for index in ordered_local]
-        ring2[candidate + 1 : candidate + 1] = insert_points
-        ring_global[candidate + 1 : candidate + 1] = insert_globals
+        anchor = _visible_anchor(ring2, h, hole)
+        if anchor is None:
+            # No cleanly visible vertex (extremely concave ring); fall back
+            # to the nearest vertex so the ring still closes.
+            anchor = min(
+                range(len(ring2)),
+                key=lambda i: (h[0] - ring2[i][0]) ** 2 + (h[1] - ring2[i][1]) ** 2,
+            )
+        ordered_local = [(h_local + k) % len(hole) for k in range(len(hole))]
+        insert_points = [hole[index] for index in ordered_local] + [h, ring2[anchor]]
+        insert_globals = [base + index for index in ordered_local] + [
+            base + h_local,
+            ring_global[anchor],
+        ]
+        ring2[anchor + 1 : anchor + 1] = insert_points
+        ring_global[anchor + 1 : anchor + 1] = insert_globals
 
     tris = _ear_clip_indices(ring2)
     accepted: List[Tuple[int, int, int]] = []
@@ -392,7 +469,9 @@ def triangulate_2d_with_holes(
             continue
         if any(_point_in_ring(centroid, hole) for hole in normalized_holes):
             continue
-        accepted.append((ring_global[a], ring_global[b], ring_global[c]))
+        accepted.append(
+            (global_perm[ring_global[a]], global_perm[ring_global[b]], global_perm[ring_global[c]])
+        )
     return accepted
 
 

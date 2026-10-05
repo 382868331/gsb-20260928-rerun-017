@@ -1,9 +1,18 @@
 {
   "pair-a": {
-    "signature": "73ee6787cff5d8fd",
+    "signature": "eaa50c6cfcb370f4",
     "report": {
       "group": "pair-a",
       "caps": [
+        {
+          "mesh": "tube",
+          "plane": "front-cut",
+          "closed": true,
+          "loops": 1,
+          "holes": 1,
+          "area": 1.6905128,
+          "open_segments": 0
+        },
         {
           "mesh": "tube",
           "plane": "side-cut",
@@ -56,10 +65,19 @@
     }
   },
   "pair-b": {
-    "signature": "e3ba39abe93fedc6",
+    "signature": "f32a84fb3d302ee7",
     "report": {
       "group": "pair-b",
       "caps": [
+        {
+          "mesh": "tube",
+          "plane": "front-cut",
+          "closed": true,
+          "loops": 1,
+          "holes": 1,
+          "area": 1.6905128,
+          "open_segments": 0
+        },
         {
           "mesh": "tube",
           "plane": "side-cut",
@@ -112,7 +130,7 @@
     }
   },
   "triangulation_b_signatures": {
-    "pair-a": "73ee6787cff5d8fd",
-    "pair-b": "e3ba39abe93fedc6"
+    "pair-a": "eaa50c6cfcb370f4",
+    "pair-b": "f32a84fb3d302ee7"
   }
 }

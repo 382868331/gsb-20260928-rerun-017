@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +19,7 @@ from renderer import (
 )
 from renderer.section import (
     OPEN_COLOR,
+    _point_in_ring,
     triangulate_2d_with_holes,
     weld_chords,
 )
@@ -39,6 +41,47 @@ def box(name="box", color=(180, 120, 80)):
 
 FRONT = Camera("front", eye=(0.0, -3.0, -6.0), target=(0, 0, 0), near=0.1, far=30)
 BACK = Camera("back", eye=(0.0, 3.0, 6.0), target=(0, 0, 0), near=0.1, far=30)
+
+
+def _triangle_area(a, b, c):
+    ab = tuple(b[k] - a[k] for k in range(3))
+    ac = tuple(c[k] - a[k] for k in range(3))
+    cross = (
+        ab[1] * ac[2] - ab[2] * ac[1],
+        ab[2] * ac[0] - ab[0] * ac[2],
+        ab[0] * ac[1] - ab[1] * ac[0],
+    )
+    return 0.5 * math.sqrt(sum(component * component for component in cross))
+
+
+def _cap_meshes(derived):
+    return [m for m in derived.meshes if "::cap::" in m.name]
+
+
+def _assert_cap_fill_matches_report(test_case, derived, report, group):
+    """Every cap mesh must actually fill what the report claims: triangle
+    areas sum to the reported section area (no overlap, no gap), every
+    vertex lies inside every retained half space, and every triangle
+    centroid stays inside the section contour projected on its plane."""
+    reported = {(cap.mesh, cap.plane): cap for cap in report.caps if cap.closed}
+    test_case.assertTrue(reported)
+    for mesh in _cap_meshes(derived):
+        object_name, _, rest = mesh.name.partition("::cap::")
+        group_name, plane_name = rest.split("::", 1)
+        cap = reported[(object_name, plane_name)]
+        plane = next(p for p in group.planes if p.name == plane_name)
+        total = 0.0
+        ring = [plane.project(v) for v in mesh.vertices]
+        for triangle in mesh.triangles:
+            a, b, c = (mesh.vertices[index] for index in triangle.indices)
+            for vertex in (a, b, c):
+                for half_space in group.planes:
+                    test_case.assertGreaterEqual(half_space.distance(vertex), -1e-6)
+            total += _triangle_area(a, b, c)
+            centroid = tuple((a[k] + b[k] + c[k]) / 3.0 for k in range(3))
+            if cap.holes == 0:
+                test_case.assertTrue(_point_in_ring(plane.project(centroid), ring))
+        test_case.assertAlmostEqual(total, cap.area, places=5)
 
 
 class TriangulationTests(unittest.TestCase):
@@ -95,6 +138,74 @@ class SinglePlaneTests(unittest.TestCase):
 
 
 class JointPlaneTests(unittest.TestCase):
+    def _joint_box_group(self, reverse=False):
+        # Closed box [-1, 1]^3, keep x <= 0.3 and y <= 0.2 jointly.
+        planes = [
+            ClipPlane("keep-x", (-1.0, 0.0, 0.0), 0.3),
+            ClipPlane("keep-y", (0.0, -1.0, 0.0), 0.2),
+        ]
+        if reverse:
+            planes.reverse()
+        return ClipGroup("joint", planes)
+
+    def test_joint_caps_are_fully_filled_not_just_reported(self):
+        for reverse in (False, True):
+            group = self._joint_box_group(reverse)
+            scene = Scene("s", [box()], [FRONT, BACK], clip_groups=[group])
+            derived, report = apply_clip_group(scene, group)
+            areas = {cap.plane: cap.area for cap in report.caps if cap.closed}
+            self.assertAlmostEqual(areas["keep-x"], 2.4, places=5)
+            self.assertAlmostEqual(areas["keep-y"], 2.6, places=5)
+            # The emitted triangles must actually cover the reported
+            # section: no overlap, no gap, all inside the kept half spaces.
+            _assert_cap_fill_matches_report(self, derived, report, group)
+
+    def test_joint_fill_is_triangulation_and_camera_invariant(self):
+        group = self._joint_box_group()
+        scene = Scene("s", [box()], [FRONT, BACK], clip_groups=[group])
+        derived, report = apply_clip_group(scene, group)
+        # A re-triangulated box (flipped face diagonals) gives the same fill.
+        flipped = box()
+        flipped.triangles = [
+            Triangle((t.indices[0], t.indices[2], t.indices[1]), t.color)
+            for t in flipped.triangles
+        ]
+        alt_scene = Scene("s", [flipped], [FRONT, BACK], clip_groups=[group])
+        alt_derived, alt_report = apply_clip_group(alt_scene, group)
+        self.assertEqual(section_signature(report), section_signature(alt_report))
+        for mesh in _cap_meshes(derived) + _cap_meshes(alt_derived):
+            total = sum(
+                _triangle_area(*(mesh.vertices[i] for i in t.indices))
+                for t in mesh.triangles
+            )
+            plane_name = mesh.name.rsplit("::", 1)[1]
+            expected = 2.4 if plane_name == "keep-x" else 2.6
+            self.assertAlmostEqual(total, expected, places=5)
+        # Both cameras see cap pixels (double-sided section fill).
+        for camera in ("front", "back"):
+            image = render(derived, RenderOptions(160, 120, camera))
+            non_background = [p for p in image.pixels if tuple(p) != tuple(scene.background)]
+            self.assertTrue(non_background)
+
+    def test_joint_fill_survives_save_and_reload(self):
+        group = self._joint_box_group()
+        scene = Scene("s", [box()], [FRONT, BACK], clip_groups=[group])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "scene.json"
+            scene.save(path)
+            loaded = Scene.load(path)
+            restored = next(g for g in loaded.clip_groups if g.name == group.name)
+            derived, report = apply_clip_group(loaded, restored)
+            _assert_cap_fill_matches_report(self, derived, report, restored)
+
+    def test_section_scene_groups_fill_matches_report(self):
+        # Tube (real through-hole) and open sheet under both joint groups:
+        # reported section area equals actually filled triangle area.
+        scene = build_section_scene()
+        for group in scene.clip_groups:
+            derived, report = apply_clip_group(scene, group)
+            _assert_cap_fill_matches_report(self, derived, report, group)
+
     def test_two_joint_planes_keep_independent_caps_and_holes(self):
         scene = build_section_scene()
         group = scene.clip_groups[0]
